@@ -1,0 +1,93 @@
+name: Create Release Note
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  BUILD_TYPE: Debug
+  TZ: "Asia/Tokyo"
+  PROJECT_DIR: "RP2040"
+
+jobs:
+  build:
+    name: Build Releases on tags
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout my project
+      uses: actions/checkout@v4
+
+    - name: Read current version
+      id: current_version
+      run: echo "CURRENT_VERSION=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+    - name: Clean workspace
+      run: |
+        echo "Cleaning up previous run"
+        rm -rf "${{ github.workspace }}/build"
+
+    - name: Checkout pico-sdk/master
+      uses: actions/checkout@v4
+      with:
+        repository: raspberrypi/pico-sdk
+        ref: master
+        path: pico-sdk
+
+    - name: Checkout pico-sdk submodules
+      working-directory: ${{github.workspace}}/pico-sdk
+      run: |
+        git submodule update --init
+        echo "PICO_SDK_PATH=$(pwd)/pico-sdk/" >> $GITHUB_ENV
+
+    - name: Install Toolchain
+      run: |
+        sudo apt update
+        sudo apt install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
+
+    - name: Create Build Environment
+      working-directory: ${{github.workspace}}
+      run:  cmake -E make_directory ${{github.workspace}}/build
+
+    - name: Configure CMake
+      shell: bash
+      working-directory: ${{github.workspace}}/build
+      run: PICO_SDK_PATH=${{github.workspace}}/pico-sdk cmake ${{github.workspace}} -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_BUILD_TYPE=Release
+
+    - name: Get core count
+      id: core_count
+      run : cat /proc/cpuinfo  | grep processor | wc -l
+
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: cmake --build ${{github.workspace}}/build --config $BUILD_TYPE --parallel $(nproc)
+
+    - name: Create Release
+      if: success()
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.current_version.outputs.CURRENT_VERSION }}
+        release_name: "[${{ steps.current_version.outputs.CURRENT_VERSION }}] Sample software"
+        body: |
+          ## This is a sample file for checking operation.
+        draft: true
+        prerelease: false
+
+    - name: Upload Release Asset
+      if: success()
+      id: upload-release-asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ${{github.workspace}}/build/DualShock4_on_picow.uf2
+        asset_name: sample_DualShock4_on_picow.uf2
+        asset_content_type: application/uf2

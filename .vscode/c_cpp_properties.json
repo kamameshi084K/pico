@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Pico", // ← "name" が追加される
+            "includePath": [
+                "${workspaceFolder}/**"
+                //"C:/Users/YourUser/pico/pico-sdk/**" // ← ヘッダーファイルの場所なども自動で入る
+            ],
+            "defines": [],
+            "compilerPath": "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-g++.exe",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-gcc-arm"
+        }
+    ],
+    "version": 4
+}
