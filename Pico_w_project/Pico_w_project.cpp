@@ -78,18 +78,17 @@
 #define milli        0.001      // convert centimeters to meters
 /* ----------------------------------------- */
 
-enum AutoMoveState {
-    MOVE_FORWARD,
-    WAIT_1,
-    MOVE_LEFT,
-    WAIT_2,
-    MOVE_DIAGONAL,
-    WAIT_3,
-    STOP
+// 状態の定義
+enum MoveState {
+    IDLE,        // 待機状態
+    MOVING_W     // Wキーで前進中
 };
 
-AutoMoveState auto_state = STOP;
-uint32_t auto_start_time = 0;
+// 動作パラメータの定義
+const float TARGET_DISTANCE_W = 3.0f;     // 目標距離 (m)
+const float VST_W_MAX = 0.3f;             // 最大目標速度 (m/s)
+const float VST_W_MIN = 0.05f;            // 最低目標速度 (m/s) これ以下になると停止
+const float SLOWDOWN_START_DISTANCE = 2.5f; // この距離から減速を開始 (m)
 
 
 static inline void cs_select_MPU() 
@@ -787,102 +786,71 @@ float Calc_target_yaw_from_rstick(float r3_x, float r3_y)
 
 int main()
 {
-    float comp_x = 0, comp_y = 0;//機体の角度
+    // 状態管理と距離計算のための変数
+    float total_distance_x = 0.0f;
+    float total_distance_y = 0.0f;
+    uint32_t loop_timer = 0;
+
+    // 制御関連の変数
+    float comp_x = 0, comp_y = 0;
     float Vgx = 0, Vgy = 0;
     float Vsy = 0, Vsx = 0;
-    int Ypulse_num = 0, Xpulse_num = 0;
-    float Vst_y = 0,Vst_x = 0;
+    float Vst_y = 0, Vst_x = 0;
 
+    // センサー関連の変数
     int32_t gy_offset[3];
     int16_t acceleration[3];
     int16_t gyro[3];
     int16_t temp;
-
     int16_t acceleration2[3];
     int16_t gyro2[3];
     int16_t temp2;
 
+    // PID制御関連の変数
+    float cor_P_Y = 0, cor_D_Y = 0;
+    float cor_P_X = 0, cor_D_X = 0;
+    float cor_PD_Y = 0, cor_PD_X = 0;
+    float Kp_value = 25.0f;
+    float Kd_value = 0.00165f;
 
-    float vib_cor_Y = 0; //操作補正量
-    float vib_cor_X = 0; //操作補正量
-    float cor_P_Y = 0;  // P control operation correction amount(P制御の操作補正量)
-    float cor_D_Y = 0;  // D control operation correction amount(D制御の操作補正量)PD制御の操作補正量
-
-    float cor_P_X = 0;  // P control operation correction amount(P制御の操作補正量)
-    float cor_D_X = 0;  // D control operation correction amount(D制御の操作補正量)
-
-    float cor_PD_Y = 0; //PD control Operation correction amount(PD制御の操作補正量)
-    float cor_PD_X = 0; //PD control Operation correction amount(PD制御の操作補正量)
-
-    int synt_vec_Y = 0, synt_vec_X = 0; //synthetic vector(合成ベクトル)
-
-    float target_yaw = 0; //目標角度
-    float save_yaw = 0; //保存用の角度
+    // モーター出力関連の変数
+    int synt_vec_Y = 0, synt_vec_X = 0;
+    float target_yaw = 0;
     float Yaw = 0;
     int yaw_output = 0;
-
-    //Motor rotation speed in the direction of travel based on PD control correction amount
-    //(PD制御の補正量から進行方向に対してのモータの回転数)
     int PD_w1 = 0, PD_w2 = 0, PD_w3 = 0; 
-
-    //Motor control value determined by vibration damping control
-    //(制振制御によって決められたモータの制御値)
     int w1_Y = 0, w2_Y = 0, w1_X = 0, w2_X = 0, w3_X = 0; 
 
     uint32_t timestamp = 0;
-    uint32_t timer=0;
 
-    //u_int32_t time=0,cycle=0,number=0;//周期確認用
+    MoveState move_state = IDLE;
+    float start_pos_y_w = 0.0f;
 
-    bool is_command_mode = false;       //コマンドモードのフラグ(comand mode flag)
-    bool is_auto_mode = false;
-    float Kp_value = 25.0f;             //比例ゲイン(Proportional gain)
-    float Kd_value = 0.00165f;          //微分ゲイン(Differential gain)
-    float adjust_step = 1.0f;           //調整用のstep数(Adjustment step number)
-    enum ParamTarget { KP, KD };        //(パラメータのターゲット)  //Parameter target
-    ParamTarget current_target = KP;    //(初期値)  //Initial value
-
-    int DMC = 0;    //キー入力なしの時のカウンタ
-
-    int w=0,a=0,s=0,d=0;    //ループ回数確認用変数
-
-        //Tc=1/2πfc fcはカットオフ周波数　Ts=サンプリングタイム
-    
-    DS4forPicoW controller;
-    bool loop_contents = true;
-    bool is_stick_moving = false;
     ////////////////////////////////////////////
     // SETUP
     ////////////////////////////////////////////
 
     stdio_init_all();
     sleep_ms(5000);
-    printf("======================\n[SETUP] DS4 on PicoW\n======================\n");
-    // controller.setup((DS4forPicoW::config){ .mac_address = "00:00:00:00:00:00" });
-    controller.setup();
-
-
-    uart_init(uart0,115200);//シリアル通信の設定 GP0,GP1ピンを使用 詳しくはpicoのピン配置図を参照
+    printf("======================\n[SETUP] PicoW Project\n======================\n");
+    
+    uart_init(uart0,115200);
     gpio_set_function(0,GPIO_FUNC_UART);
     gpio_set_function(1,GPIO_FUNC_UART);
-
     uart_puts(uart0, "Hello, MPU9250! Reading raw data from registers via SPI...\n");
 
-    // This example will use SPI0 at 0.5MHz.
-    spi_init(SPI_PORT_MPU, 1000 * 1000);//SPI通信の設定 SPI1を使用 GP8,10,11ピンの設定,センサ用 1Mhzが最大
+    spi_init(SPI_PORT_MPU, 1000 * 1000);
     gpio_set_function(PIN_MISO_MPU, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK_MPU, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI_MPU, GPIO_FUNC_SPI);
-    // Make the SPI pins available to picotool
     bi_decl(bi_3pins_with_func(PIN_MISO_MPU, PIN_MOSI_MPU, PIN_SCK_MPU, GPIO_FUNC_SPI));
 
-    gpio_init(PIN_CS_MPU);//セルセレクトのためのGP9ピンの設定
+    gpio_init(PIN_CS_MPU);
     gpio_set_dir(PIN_CS_MPU, GPIO_OUT);
     gpio_put(PIN_CS_MPU, 1);
-    // Make the CS pin available to picotool
     bi_decl(bi_1pin_with_name(PIN_CS_MPU, "SPI CS1"));
 
-    spi_init(SPI_PORT_L6470, 4000*1000);//SPI0を使用,5Mhzが最大,モタドラ用
+    spi_init(SPI_PORT_L6470, 4000*1000);
     gpio_set_function(PIN_MISO_L6470, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK_L6470, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI_L6470, GPIO_FUNC_SPI);
@@ -902,289 +870,118 @@ int main()
     printf("I2C address is 0x%x\n", id);
 
     gpio_init(16);
-    gpio_set_dir(16,GPIO_IN);//16pinを入力に設定
-    gpio_pull_up(16);//16ピンをプルアップ
+    gpio_set_dir(16,GPIO_IN);
+    gpio_pull_up(16);
     gpio_init(17);
-    gpio_set_dir(17,GPIO_OUT);//17pinを出力に設定
+    gpio_set_dir(17,GPIO_OUT);
     gpio_put(17,1);
     sleep_ms(100);
     
-    //t=time_us_32();
-
     uart_puts(uart0, "AccX, Y, Z, GyroX, Y, Z, Temp\n");
 
     while (1) 
     {
         if(gpio_get(16) == true)
         {
-            gpio_put(17,1);//LED点滅
+            gpio_put(17,1);
             sleep_ms(500);
             gpio_put(17,0);
             sleep_ms(500);
-            L6470_manualstop(Ypulse_num, Xpulse_num);
-
-            DualShock4_state state = controller.get_state();
-            if (state.linked) 
-            {
-                loop_contents = true;
-                printf("\n%s [Linked] %s\n", LOG_HEADER, controller.get_mac_address());
-            } else 
-            {
-                printf(".");
-            }
-
-            timestamp = time_us_32();
+            uint8_t buf[] = {Stop_BIT, Stop_BIT, Stop_BIT};
+            cs_select_L6470();
+            sleep_us(1);
+            spi_write_blocking(SPI_PORT_L6470, buf, 3);
+            cs_deselect_L6470();
         }
         else
         {
-            gpio_put(17, 1);//LED常時点灯
+            gpio_put(17, 1);
+            
+            uint32_t now = time_us_32();
+            float deltaT = (now - loop_timer) / 1e6f;
+            loop_timer = now;
+            
+            // 1. キー入力のチェック (ノンブロッキング)
+            int c = getchar_timeout_us(0);
 
-            DualShock4_state state;
-            tight_loop_contents();
-            state = controller.get_state();
-            StickState sticks = normalize_sticks(state);
-
-            // OPTIONSでコマンドモードに入る
-            if (!is_command_mode && state.options) 
-            {
-                is_command_mode = true;
-                printf("[Command Mode] 開始\n");
-            }
-
-            if (is_command_mode) 
-            {
-                if (state.square)
-                {
-                    current_target = (current_target == KP) ? KD : KP;
-                    sleep_ms(300);
-                    printf("Target: %s\n", current_target == KP ? "Kp" : "Kd");
-                }
-                
-                // 上でKp増加
-                if (state.hat == 0) 
-                {
-                    if(current_target == KP) 
-                    {
-                        Kp_value += adjust_step;
-                        printf("Kp: %.3f (+)\n", Kp_value);
-                    } 
-                    else if (current_target == KD) 
-                    {
-                        Kd_value += adjust_step;
-                        printf("Kd: %.6f (+)\n", Kd_value);
+            // 2. 状態に応じて動作を決定
+            switch (move_state) {
+                case IDLE:
+                    // 待機中に'w'が押されたら、移動開始
+                    if (c == 'w') {
+                        move_state = MOVING_W;
+                        start_pos_y_w = total_distance_y; // 開始時のY座標を記録
+                        printf("Wキー入力: 3m前進を開始します。\n");
+                    } else {
+                        // 待機中は停止
+                        Vst_y = 0.0f;
+                        Vst_x = 0.0f;
                     }
-                    sleep_ms(300);
-                }
-                // 下でKp減少
-                if (state.hat == 4) 
-                {
-                    if(current_target == KP) 
-                    {
-                        Kp_value -= adjust_step;
-                        printf("Kp: %.3f (-)\n", Kp_value);
-                    } 
-                    else if (current_target == KD) 
-                    {
-                        Kd_value -= adjust_step;
-                        printf("Kd: %.6f (-)\n", Kd_value);
+                    break;
+
+                case MOVING_W:
+                    // 移動距離を計算
+                    float distance_traveled = fabsf(total_distance_y - start_pos_y_w);
+                    
+                    // 減速区間に入ったかチェック
+                    if (distance_traveled < SLOWDOWN_START_DISTANCE) {
+                        // まだ減速しない -> 最高速で走行
+                        Vst_y = VST_W_MAX;
+                    } else {
+                        // 減速区間に入った -> 残り距離に応じて速度を落とす
+                        float remaining_distance = TARGET_DISTANCE_W - distance_traveled;
+                        float slowdown_zone_length = TARGET_DISTANCE_W - SLOWDOWN_START_DISTANCE;
+                        
+                        // 残り距離の割合を計算 (1.0 -> 0.0)
+                        float speed_ratio = remaining_distance / slowdown_zone_length;
+                        
+                        // 割合に応じて目標速度を計算
+                        Vst_y = VST_W_MAX * speed_ratio;
+                        
+                        // 最低速度を下回らないようにし、目標を超えたら0にする
+                        Vst_y = std::max(VST_W_MIN, Vst_y);
+                        if (remaining_distance <= 0) {
+                            Vst_y = 0.0f;
+                        }
                     }
-                    sleep_ms(300);
-                }
-                // 右で増減単位を *10（例：0.1→1.0）
-                if (state.hat == 2) 
-                {
-                    adjust_step *= 10.0f;
-                    if (adjust_step > 10.0f) adjust_step = 10.0f;
-                    printf("増減単位を変更: %.3f\n", adjust_step);
-                    sleep_ms(300);
-                }
-                // 左で増減単位を /10（例：1.0→0.1）
-                if (state.hat == 6) 
-                {
-                    adjust_step /= 10.0f;
-                    if (adjust_step < 0.000001f) adjust_step = 0.000001f;
-                    printf("増減単位を変更: %.6f\n", adjust_step);
-                    sleep_ms(300);
-                }
-                // ×ボタンで終了
-                if (state.cross) 
-                {
-                    is_command_mode = false;
-                    printf("[Command Mode] 終了\n");
-                    sleep_ms(300);
-                }
-            
-                Vst_y = 0;
-                Vst_x = 0;
-                w = 0;
-                continue;
-            }
 
-
-            float target_speed_x = 0.0f;
-            float target_speed_y = 0.0f;
-
-            if (!is_auto_mode && state.triangle) 
-            {
-                is_auto_mode = true;
-                printf("[auto Mode] 開始\n");
-            }
-            if (is_auto_mode)
-            {
-                switch (auto_state) 
-                {
-                    case STOP:
-                        if (state.triangle)
-                        {
-                            auto_state = MOVE_FORWARD;
-                            auto_start_time = time_us_32();
-                            printf("自動移動開始: 前進\n");
-                        }
-                        break;
-
-                    case MOVE_FORWARD:
-                        target_speed_x = 0.0f;
-                        target_speed_y = 0.5f;
-                        if ((time_us_32() - auto_start_time) / 1e6f >= 6.0f)
-                        {
-                            auto_state = WAIT_1;
-                            auto_start_time = time_us_32();
-                            printf("前進終了、1秒停止\n");
-                        }
-                        break;
-
-                    case WAIT_1:
-                        target_speed_x = 0.0f;
-                        target_speed_y = 0.0f;
-                        if ((time_us_32() - auto_start_time) / 1e6f >= 1.0f)
-                        {
-                            auto_state = MOVE_LEFT;
-                            auto_start_time = time_us_32();
-                            printf("左移動開始\n");
-                        }
-                        break;
-
-                    case MOVE_LEFT:
-                        target_speed_x = -0.5f;
-                        target_speed_y = 0.0f;
-                        if ((time_us_32() - auto_start_time) / 1e6f >= 4.0f)
-                        {
-                            auto_state = WAIT_2;
-                            auto_start_time = time_us_32();
-                            printf("左移動終了、1秒停止\n");
-                        }
-                        break;
-
-                    case WAIT_2:
-                        target_speed_x = 0.0f;
-                        target_speed_y = 0.0f;
-                        if ((time_us_32() - auto_start_time) / 1e6f >= 1.0f)
-                        {
-                            auto_state = MOVE_DIAGONAL;
-                            auto_start_time = time_us_32();
-                            printf("右斜め後ろ移動開始\n");
-                        }
-                        break;
-
-                    case MOVE_DIAGONAL:
-                        target_speed_x = 0.27f; // 0.5 * cos(45°)
-                        target_speed_y = -0.41f; // 0.5 * sin(45°)
-                        if ((time_us_32() - auto_start_time) / 1e6f >= 5.656f)
-                        {
-                            auto_state = WAIT_3;
-                            auto_start_time = time_us_32();
-                            printf("右斜め後ろ移動終了、停止\n");
-                        }
-                        break;
-
-                    case WAIT_3:
-                        target_speed_x = 0.0f;
-                        target_speed_y = 0.0f;
-                        auto_state = STOP;
-                        printf("自動移動完了\n");
-                        is_auto_mode = false;
-                        break;
-                }
-
-                // 自動移動時の速度設定
-                Vst_x = target_speed_x;
-                Vst_y = target_speed_y;
+                    // 目標速度が0になったら（＝ゴールしたら）待機状態に戻る
+                    if (Vst_y == 0.0f) {
+                        move_state = IDLE;
+                        printf("目標地点に到達しました。停止します。\n");
+                    }
+                    break;
             }
             
+            // 目標の向きは現在の向きを維持
+            target_yaw = Yaw;
 
-
-            if (sticks.l3_y > 0.3 || sticks.l3_y < -0.3 || sticks.l3_x > 0.3 || sticks.l3_x < -0.3)
-            {
-                Vst_y = -sticks.l3_y * 0.5;
-                Vst_x = sticks.l3_x * 0.5;
-                if (is_stick_moving == false) 
-                {
-                    is_stick_moving = true;
-                    save_yaw = Yaw; // スティックが動いたときにYawを保存
-                }
-                target_yaw = save_yaw;
-            }
-            else if(!is_auto_mode)
-            {
-                Vst_y = 0;
-                Vst_x = 0;
-                is_stick_moving = false;
-                target_yaw = Yaw; // 右スティックが動いていない場合は、現在のYawを維持
-            }
-
-            if (sticks.r3_x * sticks.r3_x + sticks.r3_y * sticks.r3_y > 0.1f) 
-                target_yaw = Calc_target_yaw_from_rstick(sticks.r3_x, sticks.r3_y);
-            
+            // --- これ以降の制御計算は変更なし ---
             P_ctrl_Y(Kp_value, Vst_y, Vsy, cor_P_Y);
             D_ctrl_Y(Kd_value, Vst_y, Vsy, cor_D_Y);
-
             P_ctrl_X(Kp_value, Vst_x, Vsx, cor_P_X);
             D_ctrl_X(Kd_value, Vst_x, Vsx, cor_D_X);
-
             cor_tot(cor_P_Y, cor_D_Y, cor_P_X, cor_D_X, cor_PD_Y, cor_PD_X);
             motor_calc(cor_PD_Y, cor_PD_X, PD_w1, PD_w2, PD_w3, synt_vec_Y, synt_vec_X);
-
             vib_ctrl_Y(comp_x, w1_Y, w2_Y);
             vib_ctrl_X(comp_y, w1_X, w2_X, w3_X);
-
             yaw_angle_control(target_yaw, Yaw, 1000, 0.1, yaw_output);
-
             motor_ctrl(PD_w1, PD_w2, PD_w3, (w1_Y + w1_X), (w2_Y + w2_X), w3_X, yaw_output, synt_vec_Y, synt_vec_X);
             
             mpu9250_read_raw2(gy_offset, acceleration, gyro, temp);
             degree_calc(acceleration, gyro, Vgx, Vgy,comp_x, comp_y, Yaw);
             sphere_speed(synt_vec_Y, synt_vec_X, Vgy, Vgx, Vsy, Vsx);
-            static uint32_t prev_time = time_us_32(); // ループ開始前の時間（staticで一度だけ宣言）
-            uint32_t now = time_us_32();
-            float deltaT = (now - prev_time) / 1e6f; // 秒に変換（μs → s）
-            prev_time = now; // 次回用に保存
+            
+            total_distance_x += Vsx * deltaT;
+            total_distance_y += Vsy * deltaT;
+
             if (time_us_32() - timestamp > 100000)
             {
-                //printf("Vst_y = %f\n", Vst_y);
-                //printf("L[X = %03d, Y = %03d]\n",state.l3_x, state.l3_y);
-                //printf("L[X = %3.1f, Y = %3.1f]\n", sticks.l3_x, sticks.l3_y);
-                //printf("DMC = %d\n", DMC);
-                //printf("w = %d\n", w);
-                //printf("Vsy = %f\n", Vsy);
-                //printf("Vsx = %f\n", Vsx);
-                printf("comp_x = %f", comp_x);
-                printf("comp_y = %f", comp_y);
-                printf("Yaw_T = %f", target_yaw);
-                printf("Yaw = %f", Yaw);
-                printf("Yaw_output = %d", yaw_output);
-                //printf("PS4_gyro_x = %6d", state.gyro_x);
-                //printf("synt_vec_Y = %d", synt_vec_Y);
-                //printf("synt_vec_X = %d\n", synt_vec_X);
-                //printf("Vgx = %f\n", Vgx);
-                //printf("Vgy = %f\n", Vgy);
-                //printf("Yaw = %f\n", Yaw);
-                //printf("cor_P_Y = %f\n", cor_P_Y);
-                //printf("cor_D_Y = %f\n", cor_D_Y);
-                //printf("cor_PD_Y = %f", cor_PD_Y);
-                //printf("cor_P_X = %f\n", cor_P_X);
-                //printf("cor_D_X = %f\n", cor_D_X);
-                //printf("cor_PD_X = %f\n", cor_PD_X);
-                //printf("T = %f\n", deltaT);
+                printf("comp_x = %f, ", comp_x);
+                printf("comp_y = %f, ", comp_y);
+                printf("Yaw_T = %f, ", target_yaw);
+                printf("Yaw = %f, ", Yaw);
+                printf("Dist_X:%.2fm, Dist_Y:%.2fm", total_distance_x, total_distance_y);
                 printf("\n");
                 timestamp = time_us_32();
             }
