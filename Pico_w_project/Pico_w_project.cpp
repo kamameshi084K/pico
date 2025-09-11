@@ -86,7 +86,7 @@ enum MoveState {
 
 // 動作パラメータの定義
 const float TARGET_DISTANCE_W = 3.0f;     // 目標距離 (m)
-const float VST_W_MAX = 0.3f;             // 最大目標速度 (m/s)
+const float VST_W_MAX = 0.5f;             // 最大目標速度 (m/s)
 const float VST_W_MIN = 0.05f;            // 最低目標速度 (m/s) これ以下になると停止
 const float SLOWDOWN_START_DISTANCE = 2.5f; // この距離から減速を開始 (m)
 
@@ -911,7 +911,7 @@ int main()
                     if (c == 'w') {
                         move_state = MOVING_W;
                         start_pos_y_w = total_distance_y; // 開始時のY座標を記録
-                        printf("Wキー入力: 3m前進を開始します。\n");
+                        printf("Wキー入力\n");
                     } else {
                         // 待機中は停止
                         Vst_y = 0.0f;
@@ -919,36 +919,21 @@ int main()
                     }
                     break;
 
+                // main関数内の switch(move_state) の中
                 case MOVING_W:
-                    // 移動距離を計算
+                    // とにかく最大速度で走り続ける
+                    Vst_y = VST_W_MAX;
+
+                    // 現在の計算上の移動距離を表示するだけ
                     float distance_traveled = fabsf(total_distance_y - start_pos_y_w);
                     
-                    // 減速区間に入ったかチェック
-                    if (distance_traveled < SLOWDOWN_START_DISTANCE) {
-                        // まだ減速しない -> 最高速で走行
-                        Vst_y = VST_W_MAX;
-                    } else {
-                        // 減速区間に入った -> 残り距離に応じて速度を落とす
-                        float remaining_distance = TARGET_DISTANCE_W - distance_traveled;
-                        float slowdown_zone_length = TARGET_DISTANCE_W - SLOWDOWN_START_DISTANCE;
-                        
-                        // 残り距離の割合を計算 (1.0 -> 0.0)
-                        float speed_ratio = remaining_distance / slowdown_zone_length;
-                        
-                        // 割合に応じて目標速度を計算
-                        Vst_y = VST_W_MAX * speed_ratio;
-                        
-                        // 最低速度を下回らないようにし、目標を超えたら0にする
-                        Vst_y = std::max(VST_W_MIN, Vst_y);
-                        if (remaining_distance <= 0) {
-                            Vst_y = 0.0f;
-                        }
-                    }
-
-                    // 目標速度が0になったら（＝ゴールしたら）待機状態に戻る
-                    if (Vst_y == 0.0f) {
+                    // printfで現在の計算上の距離を確認する
+                    // 例: printf("Calculated Distance: %.3f m\n", distance_traveled);
+                    
+                    // 's'キーが押されたら止まる（手動停止用）
+                    if (c == 's') {
+                        Vst_y = 0.0f;
                         move_state = IDLE;
-                        printf("目標地点に到達しました。停止します。\n");
                     }
                     break;
             }
@@ -956,7 +941,6 @@ int main()
             // 目標の向きは現在の向きを維持
             target_yaw = Yaw;
 
-            // --- これ以降の制御計算は変更なし ---
             P_ctrl_Y(Kp_value, Vst_y, Vsy, cor_P_Y);
             D_ctrl_Y(Kd_value, Vst_y, Vsy, cor_D_Y);
             P_ctrl_X(Kp_value, Vst_x, Vsx, cor_P_X);
