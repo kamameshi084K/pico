@@ -651,56 +651,100 @@ void motor_ctrl(int PD_w1, int PD_w2, int PD_w3, int w1, int w2, int w3, int yaw
     synt_vec_X = fin_w1 + fin_w2 + (-fin_w3);
 }
 
-void degree_calc(int16_t acceleration[], int16_t gyro[], float& Vgx, float& Vgy, float& comp_x, float& comp_y, float& angle_gz)
+/**
+ * @brief 6軸IMUデータから姿勢角を計算する。
+ * @param acceleration  加速度センサーの生データ配列 [x, y, z]
+ * @param gyro          ジャイロセンサーの生データ配列 [x, y, z] (バイアス補正済み)
+ * @param Vgx           (出力) ワールド座標系でのX軸周りの角速度 [rad/s]
+ * @param Vgy           (出力) ワールド座標系でのY軸周りの角速度 [rad/s]
+ * @param comp_x        (出力) 計算されたロール角 [deg]
+ * @param comp_y        (出力) 計算されたピッチ角 [deg]
+ * @param angle_gz      (入出力) 計算されたヨー角 [deg]
+ */
+void degree_calc(int16_t acceleration[], int16_t gyro[],
+                 float& Vgx, float& Vgy,
+                 float& comp_x, float& comp_y, float& angle_gz)
 {
-    static float Roll = 0, Pitch = 0, Yaw = 0;
-    static float previous_comp_x = 0, previous_comp_y = 0;
-    static float angle_gx;
-    static float angle_gy;
-    static float Vgz;
+    // ---- 状態を保持する変数 ----
+    static float Roll = 0.0f;  // 現在のロール角 [deg]
+    static float Pitch = 0.0f; // 現在のピッチ角 [deg]
+    
+    static float prev_roll_estimate = 0.0f;
+    static float prev_pitch_estimate = 0.0f;
 
-    static uint32_t timestamp = time_us_32();
+    // ---- 時間差(dt)の計算 ----
+    static uint32_t timestamp = 0;
+    if (timestamp == 0) {
+        timestamp = time_us_32();
+        return;
+    }
     uint32_t now = time_us_32();
-    float dt = (now - timestamp) / 1e6f;
+    float dt = (now - timestamp) / 1000000.0f; // マイクロ秒を秒に変換
     timestamp = now;
 
-    const float k = 0.985;
+    // ---- 定数 ----
+    // gyro_se はこの関数の外側で定義されているグローバル定数と仮定
+    const float k = 0.985f;
     const float DEG_TO_RAD = M_PI / 180.0f;
+    const float RAD_TO_DEG = 180.0f / M_PI;
 
-    // 角加速度の補正
+    // ---- センサー値の変換 ----
     float gx = gyro[0] * gyro_se;
     float gy = gyro[1] * gyro_se;
     float gz = gyro[2] * gyro_se;
+    
+    // ---- ジャイロによる角度変化の計算 ----
+    // 機体の傾きを考慮して、ワールド座標系での角速度に変換
+    float roll_rate  = gx + sin(Roll * DEG_TO_RAD) * tan(Pitch * DEG_TO_RAD) * gy + cos(Roll * DEG_TO_RAD) * tan(Pitch * DEG_TO_RAD) * gz;
+    float pitch_rate = cos(Roll * DEG_TO_RAD) * gy - sin(Roll * DEG_TO_RAD) * gz;
+    
+    // 角度の変化量 [deg] を計算
+    float delta_angle_roll  = roll_rate * dt;
+    float delta_angle_pitch = pitch_rate * dt;
 
-    // Roll, Pitch 角度変化
-    float gx_num = (gx + sin(Roll) * tan(Pitch) * gy + cos(Roll) * tan(Pitch) * gz);
-    float gy_num = cos(Roll) * gy - sin(Roll) * gz;
+    // ---- 加速度センサーによる角度の計算 ----
+    float accel_angle_roll  = -atan2(-acceleration[1], acceleration[2]) * RAD_TO_DEG;
+    float accel_angle_pitch = -atan2(acceleration[0], sqrt(pow((float)acceleration[1], 2) + pow((float)acceleration[2], 2))) * RAD_TO_DEG;
 
-    Vgx = gx_num * DEG_TO_RAD;
-    Vgy = gy_num * DEG_TO_RAD;
+    // ---- 相補フィルターによるロール・ピッチの統合 ----
+    comp_x = k * (prev_roll_estimate + delta_angle_roll) + (1.0f - k) * accel_angle_roll;
+    comp_y = k * (prev_pitch_estimate + delta_angle_pitch) + (1.0f - k) * accel_angle_pitch;
 
-    gx_num *= dt;
-    gy_num *= dt;
+    // 計算した現在の角度を、次回の計算で使うための変数に反映させる
+    Roll = comp_x;
+    Pitch = comp_y;
+    
+    // 次回計算用に、今回の計算結果を保存する
+    prev_roll_estimate = comp_x;
+    prev_pitch_estimate = comp_y;
 
-    angle_gx += gx_num;
-    angle_gy += gy_num;
-
-    // Yaw の更新
+    // ---- ヨーの計算 (ご指定の単純積分) ----
     float delta_yaw = gz * dt;
     angle_gz += delta_yaw;
+    
+    // ヨー角を 0～360° の範囲に正規化
+    angle_gz = fmodf(angle_gz, 360.0f);
+    if (angle_gz < 0.0f) {
+        angle_gz += 360.0f;
+    }
 
-    // 相補フィルタ
-    float ax = -atan2(-acceleration[1], acceleration[2]) * 180.0f / M_PI;
-    float ay = -atan2(acceleration[0], sqrt(acceleration[1]*acceleration[1] + acceleration[2]*acceleration[2])) * 180.0f / M_PI;
+    // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    // ★★★ ここからがオフセット補正の追加箇所 ★★★
+    // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
-    comp_x = k * (previous_comp_x + gx_num) + (1 - k) * ax;
-    comp_y = k * (previous_comp_y + gy_num) + (1 - k) * ay;
+    // ---- オフセット値の定義 ----
+    // 事前に水平な場所に置いて測定した誤差の値を設定する
+    const float roll_offset = 4.0f;  // 例：ロール角が4度ずれている場合
+    const float pitch_offset = 1.5f; // 例：ピッチ角が-0.5度ずれている場合
 
-    previous_comp_x = comp_x;
-    previous_comp_y = comp_y;
-    angle_gz = fmodf(angle_gz, 360.0f); // 余り（-360〜360）
-    if (angle_gz < 0.0f)
-        angle_gz += 360.0f; // 負の角度を正の値に変換
+    // ---- 出力用の引数に値を代入 ----
+    // フィルターで計算した値から、オフセット値を差し引く
+    comp_x = comp_x - roll_offset;
+    comp_y = comp_y - pitch_offset;
+    
+    // angle_gz は既に関数内で更新済み
+    Vgx = roll_rate * DEG_TO_RAD;
+    Vgy = pitch_rate * DEG_TO_RAD;
 }
 
 void sphere_speed(int synt_vec_Y, int synt_vec_X, float Vgy, float Vgx, float& Vsy, float& Vsx)
@@ -941,10 +985,10 @@ int main()
             // 目標の向きは現在の向きを維持
             target_yaw = Yaw;
 
-            P_ctrl_Y(Kp_value, Vst_y, Vsy, cor_P_Y);
-            D_ctrl_Y(Kd_value, Vst_y, Vsy, cor_D_Y);
-            P_ctrl_X(Kp_value, Vst_x, Vsx, cor_P_X);
-            D_ctrl_X(Kd_value, Vst_x, Vsx, cor_D_X);
+            //P_ctrl_Y(Kp_value, Vst_y, Vsy, cor_P_Y);
+            //D_ctrl_Y(Kd_value, Vst_y, Vsy, cor_D_Y);
+            //P_ctrl_X(Kp_value, Vst_x, Vsx, cor_P_X);
+            //D_ctrl_X(Kd_value, Vst_x, Vsx, cor_D_X);
             cor_tot(cor_P_Y, cor_D_Y, cor_P_X, cor_D_X, cor_PD_Y, cor_PD_X);
             motor_calc(cor_PD_Y, cor_PD_X, PD_w1, PD_w2, PD_w3, synt_vec_Y, synt_vec_X);
             vib_ctrl_Y(comp_x, w1_Y, w2_Y);
