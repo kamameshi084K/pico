@@ -1,0 +1,31 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"doxdocgen.file.copyrightTag": [
+			"@copyright Copyright (c) {year} @Akari."
+		],
+		"doxdocgen.file.versionTag": "@version 0.2.0",
+		"cSpell.words": [
+			"AVDTP",
+			"AVRCP",
+			"BNEP",
+			"btstack",
+			"DPICO",
+			"dylib",
+			"HIDS",
+			"multicore",
+			"picotool",
+			"picow",
+			"RFCOMM",
+			"RTTI",
+			"smod",
+			"stdlib",
+			"USERHOME",
+			"USERPROFILE"
+		]
+	}
+}

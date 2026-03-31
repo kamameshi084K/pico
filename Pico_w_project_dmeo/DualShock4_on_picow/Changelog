@@ -1,0 +1,15 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## Version 0.2.0 (2024-12-31)
+
+* DualShock 4
+  * Support touchpad button and touchpad position.
+* DualSense Edge
+  * Support for the PS5 controller has been added.
+
+## Version 0.1.0 (2024-12-25)
+
+* Initial release
+
