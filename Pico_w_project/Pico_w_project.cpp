@@ -206,7 +206,7 @@ static void mpu9250_read_raw1(int16_t acceleration2[], int16_t gyro2[], int16_t 
 
 
 //センサの加速度、ジャイロ、温度を読み出す関数(offset)
-static void mpu9250_read_raw2(int32_t gy_offset[], int16_t acceleration[], int16_t gyro[], int16_t& temp) 
+static void mpu9250_read_raw2(int32_t ac_offset[], int32_t gy_offset[], int16_t acceleration[], int16_t gyro[], int16_t& temp)
 {
     uint8_t buffer[6];
 
@@ -230,37 +230,34 @@ static void mpu9250_read_raw2(int32_t gy_offset[], int16_t acceleration[], int16
     temp = buffer[0] << 8 | buffer[1];
     
     for(int i = 0; i<3 ; i++){
-        //acceleration[i] -= ac_offset[i];
+        acceleration[i] -= ac_offset[i];
         gyro[i] -= gy_offset[i];
     }
 }
 
 
-void mpu9250_calibration(int32_t gy_offset[], int16_t acceleration2[], int16_t gyro2[], int16_t *temp2)
+void mpu9250_calibration(int32_t ac_offset[], int32_t gy_offset[], int16_t acceleration2[], int16_t gyro2[], int16_t *temp2)
 {
-    /*printf("---calibration() Start-----\n");
-    printf("ac_offset0. X = %6d, Y = %6d, Z = %6d\n",ac_offset[0],ac_offset[1],ac_offset[2]);
-    printf("gy_offset0. X = %6d, Y = %6d, Z = %6d\n",gy_offset[0],gy_offset[1],gy_offset[2]);   */
+    // 初期化
+    for(int i=0; i<3; i++){ ac_offset[i] = 0; gy_offset[i] = 0; }
+
     for(int t=0; t<10000; t++){
         mpu9250_read_raw1(acceleration2, gyro2, temp2);
         for(int i=0;i<3;i++){
-            //ac_offset[i] += acceleration2[i]; 
+            ac_offset[i] += acceleration2[i]; // ★コメントアウト解除
             gy_offset[i] += gyro2[i];
         }
-        /*if (t%1000 == 0){
-            printf("acce1eration. X = %6d, Y = %6d, Z = %6d\n",acceleration[0],acceleration[1],acceleration[2]);
-            printf("gyro. X = %6d, Y = %6d, Z = %6d\n",gyro[0],gyro[1],gyro[2]);
-            printf("ac_offset1. X = %6d, Y = %6d, Z = %6d\n",ac_offset[0],ac_offset[1],ac_offset[2]);
-            printf("gy_offset1. X = %6d, Y = %6d, Z = %6d\n",gy_offset[0],gy_offset[1],gy_offset[2]);   
-        }   */
     }
     for(int i=0;i<3;i++){
-        //ac_offset[i] = ac_offset[i]/1000;
         gy_offset[i] = gy_offset[i]/10000;
+        
+        // ★加速度はXとYだけオフセットを計算する（Z軸は1G=16384を残すため 0 にする）
+        if(i == 0 || i == 1) {
+            ac_offset[i] = ac_offset[i]/10000;
+        } else {
+            ac_offset[i] = 0; 
+        }
     }
-    /*printf("ac_offset2. X = %3f, Y = %3f, Z = %3f\n",ac_offset[0],ac_offset[1],ac_offset[2]);
-    printf("gy_offset2. X = %3f, Y = %3f, Z = %3f\n",gy_offset[0],gy_offset[1],gy_offset[2]);
-    printf("---calibration() Finish-----\n");   */
 }
 
 //L6470リセット時に使用する関数。ただ信号送信するだけ。
@@ -716,8 +713,8 @@ void sphere_speed(int synt_vec_Y, int synt_vec_X, float Vgy, float Vgx, float& V
     //ジャイロセンサの出力値は[°/s]なので[rad/s]に変換
     Vgy = Vgy * Rad;
     Vgx = Vgx * Rad;
-    Vsy = Vry + (Sphere_R * milli * Vgx);
-    Vsx = Vrx + (Sphere_R * milli * Vgy);
+    Vsy = Vry - (Sphere_R * milli * Vgx);
+    Vsx = Vrx - (Sphere_R * milli * Vgy);
 }
 
 /* ============================ Controller functions ============================ */
@@ -786,9 +783,12 @@ int main()
     float comp_x = 0, comp_y = 0;//機体の角度
     float Vgx = 0, Vgy = 0;
     float Vsy = 0, Vsx = 0;
+    float outer_vel_x = 0.0f;
+    float outer_vel_y = 0.0f;
     int Ypulse_num = 0, Xpulse_num = 0;
     float Vst_y = 0,Vst_x = 0;
 
+    int32_t ac_offset[3];
     int32_t gy_offset[3];
     int16_t acceleration[3], gyro[3], temp;
     int16_t acceleration2[3], gyro2[3], temp2;
@@ -817,6 +817,7 @@ int main()
     uint32_t measure_start_time = 0;
     bool is_measuring = false;
     int control_pattern = 0; // 1:PDのみ, 2:PD+制振Y, 3:PD+制振2D
+    int output_count = 0;
 
     bool is_auto_mode = false;
     uint32_t auto_start_time = 0;
@@ -826,6 +827,11 @@ int main()
     DS4forPicoW controller;
     bool is_stick_moving = false;
     bool loop_contents = true;
+
+    const float GRAVITY_MAG = 16384.0f; 
+
+    float global_acc_x = 0.0f;
+    float global_acc_y = 0.0f;
 
     ////////////////////////////////////////////
     // SETUP
@@ -859,7 +865,7 @@ int main()
 
     mpu9250_reset();
     L6470_reset();
-    mpu9250_calibration(gy_offset, acceleration2, gyro2, &temp2);
+    mpu9250_calibration(ac_offset, gy_offset, acceleration2, gyro2, &temp2);
 
     gpio_init(16);
     gpio_set_dir(16, GPIO_IN);
@@ -932,15 +938,16 @@ int main()
             // ==========================================
             if (!is_measuring && !is_auto_mode) 
             {
-                // 実験・計測モード開始
-                // 丸ボタンでPD制御のみ、バツボタンでPD+制振Y、四角ボタンでPD+制振2Dを開始
-                if (state.circle) { control_pattern = 1; is_measuring = true; measure_start_time = time_us_32(); } // 1次元球体速度PD
-                else if (state.cross) { control_pattern = 2; is_measuring = true; measure_start_time = time_us_32(); } // 1次元PD + 制振Y
-                else if (state.square) { control_pattern = 3; is_measuring = true; measure_start_time = time_us_32(); } // 2次元PD + 制振XY
+                // 実験・計測モード開始（★ それぞれに output_count = 0; を追加）
+                if (state.circle) { control_pattern = 1; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
+                else if (state.cross) { control_pattern = 2; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
+                else if (state.square) { control_pattern = 3; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
+                else if (state.triangle) { control_pattern = 4; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
                 
                 if(is_measuring) {
                     printf(">>> Measurement Start! Pattern: %d\n", control_pattern);
-                    printf("ResultLog: Time(s), Pattern, CompX(deg), CompY(deg), Vsy(m/s), Vsx(m/s)\n");
+                    // エクセル用ヘッダー
+                    printf("Time,Pattern,CompX,CompY,Vsy,Vsx\n");
                 }
 
                 // オートモード開始
@@ -1065,23 +1072,92 @@ int main()
             // ==========================================
             // 5. センサー更新
             // ==========================================
-            mpu9250_read_raw2(gy_offset, acceleration, gyro, temp);
+            mpu9250_read_raw2(ac_offset, gy_offset, acceleration, gyro, temp);
+
+            // dt（時間差分）の計算（積分用）
+            static uint32_t last_time = time_us_32();
+            uint32_t current_time = time_us_32();
+            float dt = (current_time - last_time) / 1e6f; // マイクロ秒を秒に変換
+            last_time = current_time;
+
             degree_calc(acceleration, gyro, Vgx, Vgy, comp_x, comp_y, Yaw);
+
+            // 1. 角度をラジアンに変換 (math.h の定数 M_PI を使用)
+            // comp_x を Roll(φ)、comp_y を Pitch(θ) と仮定しています。
+            // --- 重力除去と水平座標変換 ---
+            float GRAVITY_MAG = 16384.0f; 
+            float angle_x_rad = comp_y * (M_PI / 180.0f); // XとYのクロス対応
+            float angle_y_rad = comp_x * (M_PI / 180.0f);
+
+            float gravity_x = -GRAVITY_MAG * sinf(angle_x_rad);
+            float gravity_y = GRAVITY_MAG * sinf(angle_y_rad);
+            float gravity_z = GRAVITY_MAG * cosf(angle_x_rad) * cosf(angle_y_rad);
+
+            float lin_acc_x = acceleration[0] - gravity_x;
+            float lin_acc_y = acceleration[1] - gravity_y;
+            float lin_acc_z = acceleration[2] - gravity_z;
+
+            float global_acc_x = lin_acc_x * cosf(angle_x_rad) + lin_acc_z * sinf(angle_x_rad);
+            float global_acc_y = lin_acc_y * cosf(angle_y_rad) + lin_acc_z * sinf(angle_y_rad);
+
+            // --- 加速度(Raw) から 真の加速度(m/s^2) への変換 ---
+            float real_acc_x = global_acc_x * (9.80665f / GRAVITY_MAG);
+            float real_acc_y = global_acc_y * (9.80665f / GRAVITY_MAG);
+
+            // --- ノイズカット（デッドバンド） ---
+            // ±0.15 m/s^2 以下の微細な振動は0とみなしてドリフトを防ぐ
+            if (fabs(real_acc_x) < 0.15f) real_acc_x = 0.0f;
+            if (fabs(real_acc_y) < 0.15f) real_acc_y = 0.0f;
+
+            // --- 台形積分による速度(m/s)算出 ---
+            static float outer_vel_x = 0.0f;
+            static float outer_vel_y = 0.0f;
+            // ±0.15 m/s^2 以下の微細な振動は0とみなす
+            if (fabs(real_acc_x) < 0.15f) {
+                real_acc_x = 0.0f;
+                // 加速度がない（慣性で動いているか止まっている）時は、空気抵抗や摩擦のように速度を減衰させて0に近づける
+                outer_vel_x *= 0.95f; // 毎ループ5%ずつ速度を落とす
+            }
+            if (fabs(real_acc_y) < 0.15f) {
+                real_acc_y = 0.0f;
+                // 同様にY軸も減衰させる
+                outer_vel_y *= 0.95f;
+            }
+
+            // --- 台形積分による外機構の速度(m/s)算出 ---
+            static float prev_real_acc_x = 0.0f;
+            static float prev_real_acc_y = 0.0f;
+
+            outer_vel_x += ((real_acc_x + prev_real_acc_x) * dt) / 2.0f;
+            outer_vel_y += ((real_acc_y + prev_real_acc_y) * dt) / 2.0f;
+
+            prev_real_acc_x = real_acc_x;
+            prev_real_acc_y = real_acc_y;
+
             sphere_speed(synt_vec_Y, synt_vec_X, Vgy, Vgx, Vsy, Vsx);
 
             // ==========================================
             // 6. データ出力
             // ==========================================
             if (is_measuring) {
-                // 計測中はCSV形式で高速出力 (10Hz = 100ms周期、実際は制御ループに合わせて約450μs周期で出力)
-                if (time_us_32() - timestamp > 100000) { 
-                    printf("%.3f, %d, %.2f, %.2f, %.3f, %.3f\n", 
-                           (time_us_32() - measure_start_time)/1e6f, control_pattern, comp_x, comp_y, Vsy, Vsx);
-                    timestamp = time_us_32();
+                uint32_t elapsed_us = time_us_32() - measure_start_time;
+
+                // スタートからの時間が (output_count * 100,000) マイクロ秒 を超えたら出力
+                if (elapsed_us >= output_count * 100000) { 
+                    // ★ポイント: time_us_32() ではなく、output_count * 0.1f を出力する！
+                    // これで強制的に 0.0, 0.1, 0.2... と表示されます。
+                    printf("%.1f, %d, %.2f, %.2f, %.3f, %.3f\n", 
+                           output_count * 0.1f, control_pattern, comp_x, comp_y, Vsy, Vsx);
+                    output_count++; // 次の0.1秒(カウント)を待つ
                 }
-            } else if (time_us_32() - timestamp > 200000) {
-                // 通常時はデバッグ表示 (5Hz = 200ms周期)
-                printf("Pat:%d | X:%.1f | Y:%.1f | Yaw:%.1f | Auto:%d\n", control_pattern, comp_x, comp_y, Yaw, is_auto_mode);
+            } else if (time_us_32() - timestamp > 100000) {
+                // 通常時はデバッグ表示 (0.1秒ごと)に外機構の速度(Vel)も追加
+                printf("Raw[%d, %d] | Grav[%.0f, %.0f] | Ang[%.1f, %.1f] | Glo[%.1f, %.1f] | Vel[%.3f, %.3f]\n", 
+                       acceleration[0], acceleration[1], 
+                       gravity_x, gravity_y, 
+                       comp_x, comp_y, 
+                       global_acc_x, global_acc_y,
+                       outer_vel_x, outer_vel_y);
                 timestamp = time_us_32();
             }
         }
