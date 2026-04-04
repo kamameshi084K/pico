@@ -662,7 +662,8 @@ void degree_calc(int16_t acceleration[], int16_t gyro[], float& Vgx, float& Vgy,
     float dt = (now - timestamp) / 1e6f;
     timestamp = now;
 
-    const float k = 0.985;
+    float k = 0.95;
+    
     const float DEG_TO_RAD = M_PI / 180.0f;
 
     // 角加速度の補正
@@ -785,6 +786,8 @@ int main()
     float Vsy = 0, Vsx = 0;
     float outer_vel_x = 0.0f;
     float outer_vel_y = 0.0f;
+    float raw_outer_vel_x = 0.0f;
+    float raw_outer_vel_y = 0.0f;
     int Ypulse_num = 0, Xpulse_num = 0;
     float Vst_y = 0,Vst_x = 0;
 
@@ -936,26 +939,41 @@ int main()
             // ==========================================
             // 2. 計測・オートモード トリガー判定
             // ==========================================
+            static bool prev_triangle = false;
+            bool current_triangle = state.triangle;
+
+            // ★追加：△ボタンでの手動スタート/ストップ（トグル処理）
+            if (current_triangle && !prev_triangle) {
+                if (!is_measuring) {
+                    // 止まっている状態から△を押したら【計測開始】
+                    control_pattern = 4; 
+                    is_measuring = true; 
+                    measure_start_time = time_us_32(); 
+                    output_count = 0; 
+                    outer_vel_x = 0; outer_vel_y = 0; 
+                    raw_outer_vel_x = 0; raw_outer_vel_y = 0;
+                    printf(">>> Measurement Start (Manual)! Pattern: %d\n", control_pattern);
+                    printf("Time,Pattern,CompX,CompY,Vsy,Vsx,OuterVx,OuterVy,RawVx,RawVy\n");
+                } else {
+                    // 計測中に△を押したら【計測終了】
+                    is_measuring = false;
+                    printf(">>> Measurement End (Manual)\n");
+                }
+            }
+            prev_triangle = current_triangle;
+
+            // 他のボタン（〇、×、□）は今まで通り、計測中でない時だけ判定
             if (!is_measuring && !is_auto_mode) 
             {
-                // 実験・計測モード開始（★ それぞれに output_count = 0; を追加）
-                if (state.circle) { control_pattern = 1; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
-                else if (state.cross) { control_pattern = 2; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
-                else if (state.square) { control_pattern = 3; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
-                else if (state.triangle) { control_pattern = 4; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; }
+                if (state.circle) { control_pattern = 1; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; outer_vel_x = 0; outer_vel_y = 0; raw_outer_vel_x = 0; raw_outer_vel_y = 0;}
+                else if (state.cross) { control_pattern = 2; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; outer_vel_x = 0; outer_vel_y = 0; raw_outer_vel_x = 0; raw_outer_vel_y = 0;}
+                else if (state.square) { control_pattern = 3; is_measuring = true; measure_start_time = time_us_32(); output_count = 0; outer_vel_x = 0; outer_vel_y = 0; raw_outer_vel_x = 0; raw_outer_vel_y = 0;}
+                // ※△(triangle) は上で独立して処理したのでここからは削除
                 
-                if(is_measuring) {
+                // 〇×□を押したときの開始メッセージ出力
+                if(is_measuring && control_pattern != 4) { // △以外の時だけ出力
                     printf(">>> Measurement Start! Pattern: %d\n", control_pattern);
-                    // エクセル用ヘッダー
-                    printf("Time,Pattern,CompX,CompY,Vsy,Vsx\n");
-                }
-
-                // オートモード開始
-                if (state.triangle) {
-                    is_auto_mode = true;
-                    auto_state = MOVE_FORWARD;
-                    auto_start_time = time_us_32();
-                    printf(">>> Auto Mode Start!\n");
+                    printf("Time,Pattern,CompX,CompY,Vsy,Vsx,OuterVx,OuterVy,RawVx,RawVy\n");
                 }
             }
 
@@ -1085,17 +1103,45 @@ int main()
             // 1. 角度をラジアンに変換 (math.h の定数 M_PI を使用)
             // comp_x を Roll(φ)、comp_y を Pitch(θ) と仮定しています。
             // --- 重力除去と水平座標変換 ---
+            // ==============================================================
+            // 1. 重力除去のための準備（角度のラジアン変換）
+            // ==============================================================
+            // MPU9250の生データは、1G（重力）がかかったときに約16384という値を出します。
+            // これを重力の基本サイズ（ベクトル長）として定義します。
             float GRAVITY_MAG = 16384.0f; 
-            float angle_x_rad = comp_y * (M_PI / 180.0f); // XとYのクロス対応
+            
+            // 相補フィルタで計算した現在の機体の傾き（度）を、
+            // 三角関数(sin, cos)で使えるようにラジアン（π）に変換します。
+            // ※センサーの取り付け向きの都合上、X軸とY軸をクロスさせています。
+            float angle_x_rad = comp_y * (M_PI / 180.0f); 
             float angle_y_rad = comp_x * (M_PI / 180.0f);
 
+            // ==============================================================
+            // 2. 重力成分の計算（重力ベクトルをX, Y, Zに分解）
+            // ==============================================================
+            // 機体が傾いたとき、真下に向かっている重力（16384）が
+            // センサーのX軸、Y軸、Z軸にそれぞれどれくらい「分配」されるかを計算します。
+            
+            // X軸方向にかかる重力（前後に傾くほど大きくなる）
+            // ※基板の向きの都合で、X軸は傾きと逆方向に重力がかかるためマイナスをつけています
             float gravity_x = -GRAVITY_MAG * sinf(angle_x_rad);
+            
+            // Y軸方向にかかる重力（左右に傾くほど大きくなる）
             float gravity_y = GRAVITY_MAG * sinf(angle_y_rad);
+            
+            // Z軸方向にかかる重力（機体が水平に近いほど16384に近く、傾くほど減る）
             float gravity_z = GRAVITY_MAG * cosf(angle_x_rad) * cosf(angle_y_rad);
 
-            float lin_acc_x = acceleration[0] - gravity_x;
-            float lin_acc_y = acceleration[1] - gravity_y;
-            float lin_acc_z = acceleration[2] - gravity_z;
+            // ==============================================================
+            // 3. 重力の引き算（生のデータから重力成分を抜く！）
+            // ==============================================================
+            // acceleration[] は、センサーが読み取った「移動の力 ＋ 重力」が混ざった生データです。
+            // そこから、上で計算した「重力成分だけ」を引き算します。
+            // すると、残った lin_acc_x などは「純粋な移動による加速度」だけになります。
+            
+            float lin_acc_x = acceleration[0] - gravity_x; // X軸の生データから重力を抜く
+            float lin_acc_y = acceleration[1] - gravity_y; // Y軸の生データから重力を抜く
+            float lin_acc_z = acceleration[2] - gravity_z; // Z軸の生データから重力を抜く
 
             float global_acc_x = lin_acc_x * cosf(angle_x_rad) + lin_acc_z * sinf(angle_x_rad);
             float global_acc_y = lin_acc_y * cosf(angle_y_rad) + lin_acc_z * sinf(angle_y_rad);
@@ -1105,26 +1151,13 @@ int main()
             float real_acc_y = global_acc_y * (9.80665f / GRAVITY_MAG);
 
             // --- ノイズカット（デッドバンド） ---
-            // ±0.15 m/s^2 以下の微細な振動は0とみなしてドリフトを防ぐ
-            if (fabs(real_acc_x) < 0.15f) real_acc_x = 0.0f;
-            if (fabs(real_acc_y) < 0.15f) real_acc_y = 0.0f;
+            // ±0.05 m/s^2 以下の微細な振動は0とみなす（手動の押し引きを検知するため少し敏感にする）
+            //if (fabs(real_acc_x) < 0.05f) real_acc_x = 0.0f;
+            //if (fabs(real_acc_y) < 0.05f) real_acc_y = 0.0f;
 
-            // --- 台形積分による速度(m/s)算出 ---
-            static float outer_vel_x = 0.0f;
-            static float outer_vel_y = 0.0f;
-            // ±0.15 m/s^2 以下の微細な振動は0とみなす
-            if (fabs(real_acc_x) < 0.15f) {
-                real_acc_x = 0.0f;
-                // 加速度がない（慣性で動いているか止まっている）時は、空気抵抗や摩擦のように速度を減衰させて0に近づける
-                outer_vel_x *= 0.95f; // 毎ループ5%ずつ速度を落とす
-            }
-            if (fabs(real_acc_y) < 0.15f) {
-                real_acc_y = 0.0f;
-                // 同様にY軸も減衰させる
-                outer_vel_y *= 0.95f;
-            }
+            // ★ ここにあった static float outer_vel... や 0.95f の減衰処理は完全に削除しました！
 
-            // --- 台形積分による外機構の速度(m/s)算出 ---
+            // --- 純粋な台形積分による速度(m/s)算出 ---
             static float prev_real_acc_x = 0.0f;
             static float prev_real_acc_y = 0.0f;
 
@@ -1134,6 +1167,32 @@ int main()
             prev_real_acc_x = real_acc_x;
             prev_real_acc_y = real_acc_y;
 
+            // 重力成分を引かず、そのまま水平座標系に変換する
+            float raw_global_acc_x = acceleration[0] * cosf(angle_x_rad) + acceleration[2] * sinf(angle_x_rad);
+            float raw_global_acc_y = acceleration[1] * cosf(angle_y_rad) + acceleration[2] * sinf(angle_y_rad);
+
+            float raw_real_acc_x = raw_global_acc_x * (9.80665f / GRAVITY_MAG);
+            float raw_real_acc_y = raw_global_acc_y * (9.80665f / GRAVITY_MAG);
+
+            // 条件を揃えるため、ノイズカットと摩擦係数は同じものを適用
+            if (fabs(raw_real_acc_x) < 0.15f) {
+                raw_real_acc_x = 0.0f;
+                raw_outer_vel_x *= 0.95f; 
+            }
+            if (fabs(raw_real_acc_y) < 0.15f) {
+                raw_real_acc_y = 0.0f;
+                raw_outer_vel_y *= 0.95f;
+            }
+
+            static float prev_raw_real_acc_x = 0.0f;
+            static float prev_raw_real_acc_y = 0.0f;
+
+            raw_outer_vel_x += ((raw_real_acc_x + prev_raw_real_acc_x) * dt) / 2.0f;
+            raw_outer_vel_y += ((raw_real_acc_y + prev_raw_real_acc_y) * dt) / 2.0f;
+
+            prev_raw_real_acc_x = raw_real_acc_x;
+            prev_raw_real_acc_y = raw_real_acc_y;
+
             sphere_speed(synt_vec_Y, synt_vec_X, Vgy, Vgx, Vsy, Vsx);
 
             // ==========================================
@@ -1142,22 +1201,31 @@ int main()
             if (is_measuring) {
                 uint32_t elapsed_us = time_us_32() - measure_start_time;
 
-                // スタートからの時間が (output_count * 100,000) マイクロ秒 を超えたら出力
-                if (elapsed_us >= output_count * 100000) { 
-                    // ★ポイント: time_us_32() ではなく、output_count * 0.1f を出力する！
+                // スタートからの時間が (output_count * 50,000) マイクロ秒 を超えたら出力
+                if (elapsed_us >= output_count * 50000) { 
+                    // ★ポイント: time_us_32() ではなく、output_count * 0.05f を出力する！
                     // これで強制的に 0.0, 0.1, 0.2... と表示されます。
-                    printf("%.1f, %d, %.2f, %.2f, %.3f, %.3f\n", 
-                           output_count * 0.1f, control_pattern, comp_x, comp_y, Vsy, Vsx);
-                    output_count++; // 次の0.1秒(カウント)を待つ
+                    printf("%.2f, %d, %.2f, %.2f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", 
+                           output_count * 0.05f, control_pattern, comp_x, comp_y, Vsy, Vsx, outer_vel_x, outer_vel_y, raw_outer_vel_x, raw_outer_vel_y);
+                    output_count++; // 次の0.05秒(カウント)を待つ
                 }
             } else if (time_us_32() - timestamp > 100000) {
-                // 通常時はデバッグ表示 (0.1秒ごと)に外機構の速度(Vel)も追加
-                printf("Raw[%d, %d] | Grav[%.0f, %.0f] | Ang[%.1f, %.1f] | Glo[%.1f, %.1f] | Vel[%.3f, %.3f]\n", 
-                       acceleration[0], acceleration[1], 
-                       gravity_x, gravity_y, 
-                       comp_x, comp_y, 
-                       global_acc_x, global_acc_y,
-                       outer_vel_x, outer_vel_y);
+                // ==========================================
+                // ★ 変換テスト用出力（重力を引く前の加速度 m/s^2）
+                // ==========================================
+                // ① 重力を引く前の生データ (m/s^2)
+                float raw_m_s2_x = acceleration[0] * (9.80665f / GRAVITY_MAG);
+                float raw_m_s2_y = acceleration[1] * (9.80665f / GRAVITY_MAG);
+                float raw_m_s2_z = acceleration[2] * (9.80665f / GRAVITY_MAG);
+
+                // ② 重力を引いた後の真の加速度 (real_acc_x, real_acc_y はループの上部で既に計算済み)
+                
+                // 両方を並べて出力して、重力が綺麗に消えているか（そして移動加速度が残るか）確認！
+                printf("Raw[X:%5.2f, Y:%5.2f, Z:%5.2f] | Real[X:%5.2f, Y:%5.2f] | Ang[%.1f, %.1f]\n", 
+                       raw_m_s2_x, raw_m_s2_y, raw_m_s2_z, 
+                       real_acc_x, real_acc_y, 
+                       comp_x, comp_y);
+                
                 timestamp = time_us_32();
             }
         }
